@@ -1,0 +1,33 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Copyright (c) 2024 Rockchip Electronics Co., Ltd.
+ *
+ * NEARDI LKB3576 (板级 = neardi lz200) — Android 14
+ *
+ * 来源: Ubuntu SDK 的 cs-lz200-linux.dts (板厂可用的那份), 唯一结构差异:
+ *   - include 从子目录 RK3576/neardi/... 改为平铺 (Android BSP 内核 DTS 是 flat 布局)
+ *   - rk3576-linux.dtsi  →  rk3576-android.dtsi (Android 侧 display/uevent/… 节点)
+ *
+ * 维护: 改这里 = 改 Android 内核板级; 同步进 SDK 用 scripts/install_board.sh
+ */
+
+/dts-v1/;
+/* Neardi: lz200 = lc200 + ld200 */
+#include "rk3576.dtsi"
+#include "rk3576-neardi-lz200.dtsi"
+#include "rk3576-android.dtsi"
+#include "rk3576-neardi-lz200-hdmi.dtsi"
+#include "rk3576-neardi-lz200-gmac.dtsi"
+#include "rk3576-neardi-lz200-wifibt.dtsi"
+#include "rk3576-neardi-lz200-sound-ctl.dtsi"
+#include "rk3576-neardi-lz200-full-typec-phy.dtsi"
+#include "rk3576-neardi-lz200-misc-devices.dtsi"
+#include "rk3576-neardi-lz200-cam-dcphy0-comb.dtsi"
+#include "rk3576-neardi-lz200-cam-dphy1-comb.dtsi"
+#include "rk3576-neardi-lz200-cam-dphy3-comb.dtsi"
+#include "rk3576-neardi-lz200-mipi-dsi-10.1-screen.dtsi"
+
+/ {
+	model = "Rockchip RK3576 NEARDI LZ200 Board (Android 14)";
+	compatible = "rockchip,rk3576-neardi-lz200-v2", "rockchip,rk3576";
+};

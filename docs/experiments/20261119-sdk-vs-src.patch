@@ -1,0 +1,350 @@
+--- src/external/wifi_driver/ea6621q/drivers/skwifi/skw_core.c
++++ sdk/external/wifi_driver/ea6621q/drivers/skwifi/skw_core.c
+@@ -351,6 +351,15 @@
+ 	int ret;
+ 	struct skw_ba_action tx_ba;
+ 
++	/* [lz200 板级实验 2026-11-19] 验证假设: 首次 ADDBA 尝试会让 CP 切到
++	 * A-MSDU TX 路径 (该路径有缺陷: 空口实测 ethertype 被改写成 msdu_len)。
++	 * 这里临时完全停掉 TX BA setup, 看空口帧是否保持正确。
++	 */
++	if (1) {
++		skw_dbg("lkb: skip TXBA setup (tid %d, peer %d)\n", tid, peer->idx);
++		return;
++	}
++
+ 	if (tid >= SKW_NR_TID) {
+ 		skw_warn("tid: %d invalid\n", tid);
+ 		return;
+@@ -476,6 +485,7 @@
+ 		do_csum = 1;
+ 	}
+ 
++
+ 	switch (eth->h_proto) {
+ 	case htons(ETH_P_IP):
+ 		prot = ip_hdr(skb)->protocol;
+@@ -629,33 +639,82 @@
+ 		goto free;
+ 	}
+ 
+-	padding = (long)(skb->data - skw->skb_headroom) & SKW_DATA_ALIGN_MASK;
+-	if (padding)
+-		padding = SKW_DATA_ALIGN_SIZE - padding;
+-
+-	/* [lz200 板级补丁] 特殊直发路径 (EAPOL / WAPI / TDLS / UDP filter / 802.3)
+-	 * 走 skw_msg_try_send, 载荷布局是:
+-	 *     [desc_hdr 4][padding N][desc_conf 2][eth 帧]
+-	 * CP 按 4 字节对齐解析 eth 帧起点, 即实际从 round_up(4+N+2, 4) 处读。
+-	 * 原 padding 只把 desc_hdr 对齐, N=0 时 eth 落在偏移 6, CP 从 8 读 =>
+-	 * A3 与 EAPOL 载荷整体错位 2 字节 (空口实证: A3=c9:27:1e:46:24:ef,
+-	 * ethertype 0x0103), 4-way 握手 2/4 永远到不了 AP。
+-	 * 这里强制 N = 2, 使 4+2+2 = 8 天然对齐。
++	/* [lz200 板级补丁 2026-11-19] CP 的 TX 聚合路径漏写 LLC/SNAP。
++	 *
++	 * 空口实证 (主机 AP tcpdump 抓板子发的帧):
++	 *   正确 IP 帧: ... | 08 00 | 45 00 00 54 ...
++	 *   实际 IP 帧: ... | 00 54 | 45 00 00 54 ...   (ethertype 被换成 84)
++	 * 其中 0x0054 = 84 = 98 - 14 = 以太网载荷长度, 是 CP 自己算的 (desc->msdu_len
++	 * 是 skb->len=98=0x62, 对不上) ⇒ CP 把每帧包成单子帧 A-MSDU:
++	 *   DA(6) SA(6) len(2) payload
++	 * 而标准 A-MSDU 子帧的 payload 必须以 RFC1042 LLC/SNAP 开头:
++	 *   AA AA 03 | 00 00 00 | ethertype
++	 * CP 没插这 8 字节, 对端 mac80211 就把 `DA SA len` 当 802.3 头解释,
++	 * tcpdump 表现为 `802.3, length 84` + LLC dsap 0x44 —— 不是帧坏了,
++	 * 是 ethertype 丢失 ⇒ ARP/ICMP 全解析不出 ⇒ 90%+ 丢包。
++	 *
++	 * 旁证: `skw_tx.h` 里 `SKW_SNAP_HDR_LEN 8` 有定义但全仓无人使用;
++	 *       `skw_set_tx_desc_eth_type()` 是空函数 —— 厂商这步漏做了。
++	 * 旁证: 同期 ARP 帧空口完好 (ethertype 0x0806 没被替换), 说明 CP 对
++	 *       ARP/DHCP/EAPOL 走"直发"通道, 只有普通数据帧走坏的 A-MSDU 路径。
++	 *
++	 * 修法: 驱动在以太头后补 8 字节 SNAP, CP 产出的子帧变成
++	 *   DA SA len [AA AA 03 00 00 00 ethertype] payload  —— 合法 A-MSDU。
++	 *
++	 * 位置很重要: 必须放在协议解析 (ip_hdr/tcp_hdr/skb_set_transport_header)
++	 * 全部做完之后 —— 插 8 字节会让 skb 里的 header offset 整体偏 8,
++	 * 之后再解析就会读到错位数据。这里之后只用 msdu_len / l4_hdr_offset。
++	 *
++	 * 校验和: 插入后 L4 偏移 +8, 不再让 CP 做 offload (l4_hdr_offset 失效),
++	 *         先 skb_checksum_help() 在软件里算好 (这个速率开销可忽略)。
++	 *
++	 * 只对 IPv4/IPv6 生效, 不碰 ARP/802.3/EAPOL (它们本来走直发通道)。
+ 	 */
+-	if (unlikely(is_prot_filter || is_udp_filter || is_802_3_frame))
+-		padding = (SKW_DATA_ALIGN_SIZE -
+-			   (sizeof(struct skw_tx_desc_hdr) +
+-			    sizeof(struct skw_tx_desc_conf)) %
+-			   SKW_DATA_ALIGN_SIZE) % SKW_DATA_ALIGN_SIZE;
+-
+-	/* 空口实证 (mon0 抓包): CP 的 eth 帧起点 = 8 + 声明的 padding_gap,
+-	 * 与驱动实际推入多少字节无关 (= 声明 gap 0 时读 8, 声明 2 时读 10)。
+-	 * 所以特殊直发路径: 实际推 2 字节把帧顶到 8 (4 字节对齐), 但声明 gap 0,
+-	 * 让 CP 恰好从 8 读 => 帧、A3、ethertype 全部对齐。
++	if (skb->len > ETH_HLEN &&
++	    (eth->h_proto == htons(ETH_P_IP) || eth->h_proto == htons(ETH_P_IPV6))) {
++		u8 lkb_snap[SKW_SNAP_HDR_LEN] = {
++			0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00,
++			(eth->h_proto >> 8) & 0xff, eth->h_proto & 0xff,
++		};
++
++		if (do_csum) {
++			if (skb_checksum_help(skb))
++				skw_warn("lkb: snapa csum help failed\n");
++			else
++				l4_hdr_offset = 0;
++			do_csum = 0;
++		}
++
++		if (!pskb_expand_head(skb, 0, SKW_SNAP_HDR_LEN, GFP_ATOMIC)) {
++			memmove(skb->data + ETH_HLEN + SKW_SNAP_HDR_LEN,
++				skb->data + ETH_HLEN, skb->len - ETH_HLEN);
++			memcpy(skb->data + ETH_HLEN, lkb_snap, SKW_SNAP_HDR_LEN);
++			skb_put(skb, SKW_SNAP_HDR_LEN);
++
++			eth = skw_eth_hdr(skb);
++			msdu_len = skb->len;
++			SKW_SKB_TXCB(skb)->skb_native_len = skb->len;
++		}
++	}
++
++	/* [lz200 板级补丁] 所有 TX 帧统一布局 (2026-11-19):
++	 *     [desc_hdr 4][padding 2][desc_conf 2][eth 帧]  => eth 固定落在偏移 8
++	 * 并声明 padding_gap = 0, 因为实测定点: CP 的 eth 帧起点 = 8 + 声明的
++	 * padding_gap (与驱动实际推入多少字节无关)。
++	 *
++	 * 原厂逻辑: eth 实际落在 6+padding, 而 CP 从 8+padding 读 ⇒ 永远晚 2 字节,
++	 * 空口实证 ARP 的 ethertype 0x0806 被挤成 0x0001 (见下)。
++	 *
++	 * 注意 (2026-11-19 试过但不行): 改成"保持 4 字节对齐 + gap=padding-2"
++	 * (padding=4/gap=2) 会让 CP 断言 (BSPASSERT), 故这里固定 2/0。
++	 * 代价: desc_hdr 起点非 4 字节对齐, 每帧打一条 `address unaligned` 警告
++	 * (不丢包, 仅日志噪音)。
+ 	 */
+-	desc_gap = padding;
+-	if (unlikely(is_prot_filter || is_udp_filter || is_802_3_frame))
+-		desc_gap = 0;
++	padding = (SKW_DATA_ALIGN_SIZE -
++		   (sizeof(struct skw_tx_desc_hdr) +
++		    sizeof(struct skw_tx_desc_conf)) %
++		   SKW_DATA_ALIGN_SIZE) % SKW_DATA_ALIGN_SIZE;
++	desc_gap = 0;
+ 
+ 	nroom = skb_headroom(skb);
+ 	nhead = skw->skb_headroom > nroom ? skw->skb_headroom - nroom : 0;
+--- src/external/wifi_driver/ea6621q/drivers/skwifi/skw_cfg80211.c
++++ sdk/external/wifi_driver/ea6621q/drivers/skwifi/skw_cfg80211.c
+@@ -1945,7 +1945,7 @@
+ {
+ 	int i, ret;
+ 	bool is_cqm_scan;
+-	struct skw_scan_chan_info *chan;
++	u16 *chan;
+ 	int size, nssids_size, offset;
+ 	u8 target_chn;
+ 	u16 scan_chn_num = 0;
+@@ -1965,7 +1965,7 @@
+ 		n_channels = 1;
+ 
+ 	size = sizeof(struct skw_scan_param) +
+-	       n_channels * sizeof(struct skw_scan_chan_info) +
++	       n_channels * sizeof(u16) +
+ 	       req->n_ssids * sizeof(struct cfg80211_ssid) +
+ 	       req->ie_len;
+ 
+@@ -2000,15 +2000,9 @@
+ 	param->chan_offset = offset;
+ 	param->nr_chan = n_channels;
+ 
+-	chan = (struct skw_scan_chan_info *)(buff + offset);
++	chan = (u16 *)(buff + offset);
+ 	if (is_cqm_scan) {
+-		chan->chan_num = target_chn;
+-		for (i = 0; i < req->n_channels; i++) {
+-			if (req->channels[i]->hw_value == target_chn) {
+-				chan->band = to_skw_band(req->channels[i]->band);
+-				break;
+-			}
+-		}
++		chan[0] = target_chn;
+ 		scan_chn_num++;
+ 	} else {
+ 		for (i = 0; i < param->nr_chan; i++) {
+@@ -2017,15 +2011,13 @@
+ 					continue;
+ 			}
+ 
+-			chan->chan_num = req->channels[i]->hw_value;
+-			chan->band = to_skw_band(req->channels[i]->band);
++			chan[scan_chn_num] = req->channels[i]->hw_value;
+ 
+ 			if (req->channels[i]->flags & SKW_PASSIVE_SCAN ||
+ 			    !req->n_ssids) {
+-				chan->scan_flags |= SKW_SCAN_FLAG_PASSIVE;
++				chan[scan_chn_num] |= SKW_SCAN_FLAG_PASSIVE;
+ 			}
+ 
+-			chan++;
+ 			scan_chn_num++;
+ 		}
+ 	}
+@@ -2350,7 +2342,7 @@
+ }
+ 
+ static int skw_cmd_join(struct wiphy *wiphy, struct net_device *ndev,
+-			struct cfg80211_bss *bss, u32 bw, u8 band,
++			struct cfg80211_bss *bss, u32 bw,
+ 			u16 center_chn1, u16 center_chn2,
+ 			bool roaming, struct skw_join_resp *resp)
+ {
+@@ -2370,7 +2362,6 @@
+ 		return -ENOMEM;
+ 
+ 	params->bandwidth = bw;
+-	params->band = band;
+ 	params->center_chn1 = center_chn1;
+ 	params->center_chn2 = center_chn2;
+ 	params->chan_num = bss->channel->hw_value;
+@@ -2679,9 +2670,8 @@
+ 	if (ndev->ieee80211_ptr->iftype == NL80211_IFTYPE_STATION)
+ 		skw_set_he_mib(wiphy, he_enable);
+ 
+-	ret = skw_cmd_join(wiphy, ndev, bss, cc.bw,
+-			   to_skw_band(bss->channel->band),
+-			   cc.center_chn1, cc.center_chn2, roaming, &resp);
++	ret = skw_cmd_join(wiphy, ndev, bss, cc.bw, cc.center_chn1,
++			   cc.center_chn2, roaming, &resp);
+ 	if (ret < 0) {
+ 		skw_err("command join failed, ret: %d\n", ret);
+ 		SKW_KFREE(peer);
+@@ -3861,8 +3851,7 @@
+ 				struct cfg80211_sched_scan_request *req)
+ {
+ 	int i, ret;
+-	struct skw_scan_chan_info *chan = NULL;
+-	u16 scan_chn_num = 0;
++	u16 *chan = NULL;
+ 
+ 	u32 delay = 0;
+ 	u64 reqid = 0;
+@@ -3910,7 +3899,7 @@
+ 	n_match_len = req->n_match_sets * sizeof(struct skw_sched_match_sets);
+ 
+ 	size = fixed + req->ie_len + n_ssids_len + n_plans_len + n_match_len +
+-	       req->n_channels * sizeof(struct skw_scan_chan_info);
++	       req->n_channels * sizeof(u16);
+ 
+ 	params = SKW_ALLOC(size, GFP_KERNEL);
+ 	if (!params) {
+@@ -3978,21 +3967,17 @@
+ 		offset += req->ie_len;
+ 	}
+ 
+-	chan = (struct skw_scan_chan_info *)(params->data + offset);
++	chan = (u16 *)(params->data + offset);
+ 	for (i = 0; i < req->n_channels; i++) {
+-		chan->band = to_skw_band(req->channels[i]->band);
+-		chan->chan_num = req->channels[i]->hw_value;
++		chan[i] = req->channels[i]->hw_value;
+ 
+-		/* scan_flags 里 1 表示该信道被动扫描 */
++		/* BIT[15]: set 1 means to run a passive scan on this channel */
+ 		if (req->channels[i]->flags & SKW_PASSIVE_SCAN)
+-			chan->scan_flags |= SKW_SCAN_FLAG_PASSIVE;
+-
+-		chan++;
+-		scan_chn_num++;
++			chan[i] |= SKW_SCAN_FLAG_PASSIVE;
+ 	}
+ 
+-	params->n_channels = scan_chn_num;
+-	params->channels_len = scan_chn_num * sizeof(struct skw_scan_chan_info);
++	params->n_channels = req->n_channels;
++	params->channels_len = req->n_channels * sizeof(u16);
+ 	params->channels_offset = fixed + offset;
+ 
+ 	skw->sched_scan_req = req;
+--- src/external/wifi_driver/ea6621q/drivers/skwifi/skw_msg.c
++++ sdk/external/wifi_driver/ea6621q/drivers/skwifi/skw_msg.c
+@@ -1840,7 +1840,23 @@
+ 			ret, skw->flags, atomic_read(&skw->xmitting_data),
+ 			jiffies_to_msecs(timeout));
+ 
+-		skw_hw_assert(skw);
++		/* [lz200 板级补丁] 同步路径与异步路径 (skw_cmd_timeout_fn) 对齐:
++		 * 原厂这里"单次超时就 skw_hw_assert()" ⇒ 一条命令 2s 没 ACK 就把
++		 * CP 打死, 而 CP 复位后 FW_ASSERT 位不清 ⇒ WiFi/蓝牙全废, 只能重启。
++		 * 实测 (2026-11-19) framework 主动断开时发的 SKW_CMD_DISCONNECT[17]
++		 * 就走的这条路, 直接把 CP 断言成 op_service.c-161。
++		 * 改为连续 SKW_CMD_TMO_RETRY 次超时才断言, 任意正常 ACK 清零计数
++		 * (skw_cmd_ack_handler 里 skw_cmd_tmo_cnt = 0)。
++		 */
++		if (++skw_cmd_tmo_cnt < SKW_CMD_TMO_RETRY) {
++			skw_warn("sync cmd timeout %d/%d, %s[%d] dropped (no assert)\n",
++				 skw_cmd_tmo_cnt, SKW_CMD_TMO_RETRY, name, cmd);
++		} else {
++			skw_cmd_tmo_cnt = 0;
++			skw_err("sync cmd timeout %d times in a row, assert CP\n",
++				SKW_CMD_TMO_RETRY);
++			skw_hw_assert(skw);
++		}
+ 	}
+ 
+ 	skw_cmd_unlock(skw, extra_flags);
+--- src/external/wifi_driver/ea6621q/drivers/skwifi/skw_rx.c
++++ sdk/external/wifi_driver/ea6621q/drivers/skwifi/skw_rx.c
+@@ -1426,21 +1426,51 @@
+ 
+ 		/* [lz200 板级补丁] 见 skw_rx_eth_sane() 上的说明: 本板 CP 的
+ 		 * 数据帧固定从偏移 18 开始、长度 msdu_len+6, desc 其余字段
+-		 * (tid/peer/sn/snap/eapol) 全部不可信, 所以先尝试带自检的
+-		 * 直接投递, 通过了就跳过 reorder/replay/iface 那一套。
++		 * (msdu_offset/tid/peer/sn/snap/eapol) 全部不可信, 所以先尝试
++		 * 带自检的直接投递, 通过了就跳过 reorder/replay/iface 那一套。
++		 * 2026-11-19: 下行单播帧 (AP→STA 的 ARP 应答/ICMP) CP 会把
++		 * msdu_offset 填成非 0 垃圾值, 原来只在 ==0 时才走自检 ⇒ 这些帧
++		 * 全落到 "invlid peer" 被丢, AP 侧 ARP 一直等不到应答,
++		 * IpReachabilityMonitor NUD_FAILED → framework 反复拆/建网络。
++		 * 现在不再依赖 msdu_offset: 先按 msdu_len+6 试, 不行再按
++		 * skb 剩余长度试, 以太网头自检通过就投递。
+ 		 */
+-		if (desc->msdu_offset == 0) {
++		{
+ 			struct skw_iface *ifc = skw_eapol_iface(skw,
+ 							       desc->inst_id);
+ 			int flen = desc->msdu_len + SKW_LKB_RX_LEN_ADJ;
++			int mode = 0;
+ 
+ 			if (skw_rx_eth_sane(ifc, skb, SKW_LKB_RX_FRAME_OFF,
+ 					    flen)) {
++				mode = 1;
++			} else {
++				flen = (int)skb->len - SKW_LKB_RX_FRAME_OFF;
++				if (skw_rx_eth_sane(ifc, skb,
++						    SKW_LKB_RX_FRAME_OFF, flen))
++					mode = 2;
++			}
++
++			if (mode) {
++				if (net_ratelimit())
++					skw_warn("rx eth deliver: mode %d off %d msdu_off %d msdu_len %d skb_len %d len %d proto 0x%04x\n",
++						 mode, SKW_LKB_RX_FRAME_OFF,
++						 desc->msdu_offset, desc->msdu_len,
++						 skb->len, flen,
++						 ntohs(((struct ethhdr *)(skb->data +
++							SKW_LKB_RX_FRAME_OFF))->h_proto));
+ 				skb_pull(skb, SKW_LKB_RX_FRAME_OFF);
+ 				__skb_trim(skb, flen);
+ 				skw_rx_deliver_eth(ifc, skb);
+ 				continue;
+ 			}
++
++			if (desc->msdu_offset || desc->msdu_len)
++				if (net_ratelimit())
++					skw_warn("rx eth reject: msdu_off %d msdu_len %d skb_len %d peer %d tid %d\n",
++						 desc->msdu_offset, desc->msdu_len,
++						 skb->len, desc->peer_idx,
++						 desc->tid);
+ 		}
+ 
+ 		if (desc->peer_idx >= SKW_MAX_PEER_SUPPORT ||

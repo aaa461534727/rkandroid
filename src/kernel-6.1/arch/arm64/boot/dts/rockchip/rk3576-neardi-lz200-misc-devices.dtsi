@@ -1,0 +1,139 @@
+/* pcie */
+&pcie0 {
+	reset-gpios = <&gpio2 RK_PB1 GPIO_ACTIVE_HIGH>;
+	rockchip,skip-scan-in-resume;
+	pinctrl-name = "default";
+	pinctrl-0 = <&pcie_rst>;
+	status = "okay";
+};
+/* pcie device power enable */
+&{/} {
+	pcie_dev_pwren: pcie_dev_pwren {
+		compatible = "regulator-fixed";
+		regulator-name = "Pcie_Pwren";
+		regulator-boot-on;
+		enable-active-high;
+		regulator-always-on;
+		gpio = <&gpio0 RK_PD3 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&pwren_pcie>;
+	};
+};
+/* 4G power */
+&{/} {
+	vcc_lte_en: vcc_lte_en {
+		compatible = "regulator-fixed";
+		regulator-name = "Lte_Pwren";
+		regulator-boot-on;
+		enable-active-high;
+		regulator-always-on;
+		gpio = <&gpio0 RK_PB6 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&pwren_lte>;
+	};
+};
+/* can */
+&can0 {
+	assigned-clocks = <&cru CLK_CAN0>;
+	assigned-clock-rates = <200000000>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&can0m0_pins>;
+	status = "okay";
+};
+
+&can1 {
+	assigned-clocks = <&cru CLK_CAN1>;
+	assigned-clock-rates = <200000000>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&can1m1_pins>;
+	status = "okay";
+};
+/* 485 */
+&uart5 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart5m2_xfer>;
+};
+/* led */
+&{/} {
+	leds: leds {
+		compatible = "gpio-leds";
+		work_led: work_led {
+			label = "status:led:work";
+			gpios = <&gpio0 RK_PA7 GPIO_ACTIVE_HIGH>;
+			linux,default-trigger = "timer";
+			delay-on = <1000>;
+			delay-off = <1000>;
+		};
+	};
+};
+/* usb type-A vbus */
+&{/} {
+	vcc_usb_vbus: vcc_usb_vbus {
+		compatible = "regulator-fixed";
+		regulator-name = "vbus_Pwren";
+		regulator-boot-on;
+		enable-active-high;
+		regulator-always-on;
+		gpio = <&gpio1 RK_PC7 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&pwren_vbus>;
+	};
+};
+
+&gt1x {
+	status = "disabled";
+};
+
+&uart4 {
+	pinctrl-0 = <&uart4m1_xfer>;
+};
+
+/* ufs */
+&{/} {
+	clk_gpio_mphy_i: clk_gpio_mphy_i  { 
+        compatible = "fixed-clock"; 
+        #clock-cells = <0>; 
+        clock-frequency = <26000000>; 
+        clock-output-names = "clk_gpio_mphy_i"; 
+    };
+};
+
+&ufs {
+	status = "okay";
+    compatible = "rockchip,rk3576-ufs";
+    pinctrl-0 = <&ufs_refclk>;
+    reset-gpios = <&gpio4 RK_PD0 GPIO_ACTIVE_HIGH>;
+    assigned-clock-parents = <&clk_gpio_mphy_i>;
+};
+#if 0
+/* Debug: rk3576j fails to start */
+&bus_a72 {
+    bus-supply = <&vdd_logic_s0>;
+    pvtm-supply = <&vdd_logic_s0>;
+    status = "okay";
+};
+#endif
+&pinctrl {
+	lte {
+		pwren_lte: pwren_lte {
+			rockchip,pins = <0 RK_PB6 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+
+	pcie {
+		pcie_rst: pcie_rst {
+			rockchip,pins = <2 RK_PB1 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+
+		pwren_pcie: pwren_pcie {
+			rockchip,pins = <0 RK_PD3 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+
+	usb {
+		pwren_vbus: pwren_vbus {
+			rockchip,pins = <1 RK_PC7 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+};
